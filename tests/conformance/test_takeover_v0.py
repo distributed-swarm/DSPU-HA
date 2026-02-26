@@ -6,22 +6,6 @@ import time
 import httpx
 
 
-def dump_proc(p: subprocess.Popen, label: str) -> None:
-    """
-    Best-effort dump of a controller subprocess output to make CI failures obvious.
-    """
-    try:
-        rc = p.poll()
-        print(f"\n--- {label} (pid={p.pid}) returncode={rc} ---")
-        if p.stdout:
-            out = p.stdout.read()
-            if out:
-                print(out)
-        print(f"--- end {label} ---\n")
-    except Exception as e:
-        print(f"\n--- {label} dump failed: {e!r} ---\n")
-
-
 def wait_http(url: str, timeout_s: float = 10.0) -> None:
     deadline = time.time() + timeout_s
     last = None
@@ -43,7 +27,6 @@ def start_controller(node_id: str, port: int, db_url: str) -> subprocess.Popen:
     e["NODE_ID"] = node_id
     e["DATABASE_URL"] = db_url
     e["LEADER_POLL_S"] = "0.2"
-    # allow schema init retry on CI
     e.setdefault("PG_SCHEMA_RETRY_S", "15")
     e.setdefault("PG_SCHEMA_RETRY_INTERVAL_S", "0.5")
 
@@ -55,6 +38,24 @@ def start_controller(node_id: str, port: int, db_url: str) -> subprocess.Popen:
         stderr=subprocess.STDOUT,
         text=True,
     )
+
+
+def stop_and_dump(p: subprocess.Popen, label: str, timeout_s: float = 2.0) -> None:
+    try:
+        if p.poll() is None:
+            p.terminate()
+        try:
+            out, _ = p.communicate(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            out, _ = p.communicate(timeout=timeout_s)
+        rc = p.returncode
+        print(f"\n--- {label} (pid={p.pid}) returncode={rc} ---")
+        if out:
+            print(out)
+        print(f"--- end {label} ---\n")
+    except Exception as e:
+        print(f"\n--- {label} stop/dump failed: {e!r} ---\n")
 
 
 def get_role(base: str) -> dict:
@@ -100,8 +101,8 @@ def test_leader_takeover_increments_epoch():
             wait_http(f"{a}/healthz")
             wait_http(f"{b}/healthz")
         except Exception:
-            dump_proc(p1, "controller-a")
-            dump_proc(p2, "controller-b")
+            stop_and_dump(p1, "controller-a")
+            stop_and_dump(p2, "controller-b")
             raise
 
         (leader_base, leader_role), (standby_base, standby_role) = wait_for_roles(a, b)
@@ -114,7 +115,7 @@ def test_leader_takeover_increments_epoch():
         assert rS.status_code == 409
         assert rS.json()["error"] == "NOT_LEADER"
 
-        # kill leader
+        # kill leader process (but don't block on it)
         leader_proc = p1 if leader_base.endswith(":18080") else p2
         leader_proc.terminate()
         try:
@@ -141,18 +142,5 @@ def test_leader_takeover_increments_epoch():
         assert post_lease(standby_base).status_code == 204
 
     finally:
-        # Always dump logs so failures are obvious in CI
-        dump_proc(p1, "controller-a")
-        dump_proc(p2, "controller-b")
-
-        for p in (p1, p2):
-            if p.poll() is None:
-                p.terminate()
-        for p in (p1, p2):
-            try:
-                p.wait(timeout=5)
-            except Exception:
-                try:
-                    p.kill()
-                except Exception:
-                    pass
+        stop_and_dump(p1, "controller-a")
+        stop_and_dump(p2, "controller-b")
