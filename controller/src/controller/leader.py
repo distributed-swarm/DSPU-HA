@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import os
@@ -29,10 +28,17 @@ class LeaderElector:
     """
 
     def __init__(self) -> None:
+        # Required
         self._db_url = os.environ["DATABASE_URL"]
+
+        # Optional
         self._node_id = os.getenv("NODE_ID", "node-unknown")
         self._lock_key = int(os.getenv("LEADER_LOCK_KEY", str(LOCK_KEY_DEFAULT)))
         self._poll_s = float(os.getenv("LEADER_POLL_S", "0.5"))
+
+        # Retry knobs (important for CI + real boot)
+        self._schema_retry_s = float(os.getenv("PG_SCHEMA_RETRY_S", "10"))
+        self._schema_retry_interval_s = float(os.getenv("PG_SCHEMA_RETRY_INTERVAL_S", "0.5"))
 
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -45,7 +51,8 @@ class LeaderElector:
         self._state_lock = threading.Lock()
 
     def start(self) -> None:
-        self._ensure_schema()
+        # Ensure DB is reachable and meta table exists before starting loop
+        self._ensure_schema_with_retry()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -60,7 +67,21 @@ class LeaderElector:
 
     # --- internals ---
 
-    def _ensure_schema(self) -> None:
+    def _ensure_schema_with_retry(self) -> None:
+        deadline = time.time() + self._schema_retry_s
+        last_exc: Exception | None = None
+
+        while time.time() < deadline:
+            try:
+                self._ensure_schema_once()
+                return
+            except Exception as e:
+                last_exc = e
+                time.sleep(self._schema_retry_interval_s)
+
+        raise RuntimeError(f"Could not initialize Postgres schema within {self._schema_retry_s}s: {last_exc}")
+
+    def _ensure_schema_once(self) -> None:
         with psycopg.connect(self._db_url) as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -71,13 +92,12 @@ class LeaderElector:
                     );
                     """
                 )
+
                 # initialize leader_epoch if missing
                 cur.execute("SELECT v FROM dspu_meta WHERE k='leader_epoch'")
                 row = cur.fetchone()
                 if row is None:
-                    cur.execute(
-                        "INSERT INTO dspu_meta (k, v) VALUES ('leader_epoch', '0')"
-                    )
+                    cur.execute("INSERT INTO dspu_meta (k, v) VALUES ('leader_epoch', '0')")
             conn.commit()
 
     def _get_epoch(self, conn) -> int:
@@ -88,10 +108,7 @@ class LeaderElector:
 
     def _set_epoch(self, conn, epoch: int) -> None:
         with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE dspu_meta SET v=%s WHERE k='leader_epoch'",
-                (str(epoch),),
-            )
+            cur.execute("UPDATE dspu_meta SET v=%s WHERE k='leader_epoch'", (str(epoch),))
 
     def _try_lock(self, conn) -> bool:
         with conn.cursor() as cur:
@@ -106,7 +123,7 @@ class LeaderElector:
 
     def _run(self) -> None:
         # Keep a persistent connection so the advisory lock is held by session.
-        # If the process dies, the session dies, lock is released. That's what we want.
+        # If the process dies, the session dies, lock is released.
         conn = psycopg.connect(self._db_url)
         conn.autocommit = True
 
@@ -130,7 +147,6 @@ class LeaderElector:
                         except Exception:
                             epoch = 0
                         self._set_state(role="STANDBY", leader_epoch=epoch, leader_id=None)
-
                 else:
                     # leader: keep advertising
                     self._set_state(role="LEADER", leader_epoch=my_epoch, leader_id=self._node_id)
