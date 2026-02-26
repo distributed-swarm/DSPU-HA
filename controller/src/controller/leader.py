@@ -1,159 +1,167 @@
+from __future__ import annotations
+
 import os
+import threading
 import time
 from dataclasses import dataclass
-from typing import Optional
 
 import psycopg
 
 
-# One global lock id for schema init. Any constant int8 is fine.
-# Pick something stable and boring.
+LOCK_KEY_DEFAULT = 915_707_001
 SCHEMA_LOCK_ID = 7878787878
 
 
 @dataclass(frozen=True)
-class RoleState:
-    role: str  # "LEADER" | "STANDBY"
+class LeaderState:
     node_id: str
-    leader_id: str
-    leader_epoch: int
+    role: str  # "LEADER" | "STANDBY"
+    leader_epoch: int | None
+    leader_id: str | None
 
 
-def _now_ms() -> int:
-    return int(time.time() * 1000)
-
-
-def ensure_schema_with_retry(db_url: str) -> None:
+class LeaderElector:
     """
-    Ensure required tables exist.
-
-    IMPORTANT: This must be safe under concurrent startup of multiple controllers.
-    We serialize schema init with pg_advisory_xact_lock to prevent catalog races.
+    v0 leader election:
+    - Postgres advisory lock (exclusive, session-level)
+    - leader_epoch + leader_id stored in dspu_meta
+    - background thread holds the lock for the lifetime of the process
     """
-    total_retry_s = float(os.getenv("PG_SCHEMA_RETRY_S", "15"))
-    interval_s = float(os.getenv("PG_SCHEMA_RETRY_INTERVAL_S", "0.5"))
-    deadline = time.time() + total_retry_s
-    last_err: Optional[Exception] = None
 
-    while time.time() < deadline:
-        try:
-            with psycopg.connect(db_url) as conn:
-                # Use an explicit transaction so advisory_xact_lock is held
-                # for the duration of schema creation and released on commit/rollback.
-                with conn.transaction():
-                    conn.execute("SELECT pg_advisory_xact_lock(%s);", (SCHEMA_LOCK_ID,))
+    def __init__(self) -> None:
+        self._db_url = os.environ["DATABASE_URL"]
+        self._node_id = os.getenv("NODE_ID", "node-unknown")
+        self._lock_key = int(os.getenv("LEADER_LOCK_KEY", str(LOCK_KEY_DEFAULT)))
+        self._poll_s = float(os.getenv("LEADER_POLL_S", "0.5"))
+        self._schema_retry_s = float(os.getenv("PG_SCHEMA_RETRY_S", "15"))
+        self._schema_retry_interval_s = float(os.getenv("PG_SCHEMA_RETRY_INTERVAL_S", "0.5"))
 
-                    # Minimal schema for our HA v0 tests
-                    conn.execute(
-                        """
-                        CREATE TABLE IF NOT EXISTS dspu_meta (
-                            k TEXT PRIMARY KEY,
-                            v TEXT NOT NULL
-                        );
-                        """
-                    )
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._state_lock = threading.Lock()
+        self._state = LeaderState(
+            node_id=self._node_id,
+            role="STANDBY",
+            leader_epoch=None,
+            leader_id=None,
+        )
 
-                    # Leader lock / epoch record lives in dspu_meta:
-                    # - k='leader_id' -> node_id
-                    # - k='leader_epoch' -> int
-                    # - k='updated_ms' -> ms since epoch
-                    #
-                    # Nothing else required yet for conformance tests.
+    def start(self) -> None:
+        self._ensure_schema_with_retry()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
 
-            return  # success
-        except Exception as e:
-            last_err = e
-            time.sleep(interval_s)
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2)
 
-    raise RuntimeError(f"schema init failed after {total_retry_s}s: {last_err!r}") from last_err
+    def state(self) -> LeaderState:
+        with self._state_lock:
+            return self._state
 
+    # --- schema ---
 
-def try_acquire_leader(db_url: str, node_id: str) -> RoleState:
-    """
-    Single-leader election using a PG advisory lock + durable epoch in dspu_meta.
+    def _ensure_schema_with_retry(self) -> None:
+        deadline = time.time() + self._schema_retry_s
+        last_exc: Exception | None = None
+        while time.time() < deadline:
+            try:
+                self._ensure_schema_once()
+                return
+            except Exception as e:
+                last_exc = e
+                time.sleep(self._schema_retry_interval_s)
+        raise RuntimeError(f"schema init failed after {self._schema_retry_s}s: {last_exc!r}")
 
-    We use a session-level advisory lock to guarantee only one LEADER at a time.
-    Epoch increments on each successful leader acquisition.
-    """
-    leader_id = node_id
-    poll_s = float(os.getenv("LEADER_POLL_S", "0.5"))
-
-    # The lock id used for leader election (distinct from schema lock).
-    # Stable constant int8.
-    leader_lock_id = 4242424242
-
-    while True:
-        ensure_schema_with_retry(db_url)
-
-        try:
-            conn = psycopg.connect(db_url)
-            conn.autocommit = True  # required for session advisory locks to behave predictably
-
-            # Try to take the leader lock immediately; if we can’t, we’re standby.
-            got = conn.execute("SELECT pg_try_advisory_lock(%s);", (leader_lock_id,)).fetchone()[0]
-            if not got:
-                conn.close()
-                # We are standby; read current leader info best-effort.
-                return read_role(db_url, node_id)
-
-            # We are leader. Bump epoch durably.
+    def _ensure_schema_once(self) -> None:
+        with psycopg.connect(self._db_url) as conn:
             with conn.transaction():
-                # Read current epoch
+                conn.execute("SELECT pg_advisory_xact_lock(%s);", (SCHEMA_LOCK_ID,))
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS dspu_meta (
+                        k TEXT PRIMARY KEY,
+                        v TEXT NOT NULL
+                    );
+                    """
+                )
                 row = conn.execute("SELECT v FROM dspu_meta WHERE k='leader_epoch';").fetchone()
-                cur_epoch = int(row[0]) if row else 0
-                new_epoch = cur_epoch + 1
+                if row is None:
+                    conn.execute("INSERT INTO dspu_meta (k, v) VALUES ('leader_epoch', '0');")
 
-                conn.execute(
-                    """
-                    INSERT INTO dspu_meta (k, v) VALUES ('leader_epoch', %s)
-                    ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v;
-                    """,
-                    (str(new_epoch),),
-                )
-                conn.execute(
-                    """
-                    INSERT INTO dspu_meta (k, v) VALUES ('leader_id', %s)
-                    ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v;
-                    """,
-                    (leader_id,),
-                )
-                conn.execute(
-                    """
-                    INSERT INTO dspu_meta (k, v) VALUES ('updated_ms', %s)
-                    ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v;
-                    """,
-                    (str(_now_ms()),),
-                )
+    # --- election loop ---
 
-            return RoleState(role="LEADER", node_id=node_id, leader_id=leader_id, leader_epoch=new_epoch)
+    def _run(self) -> None:
+        conn = psycopg.connect(self._db_url)
+        conn.autocommit = True
 
-        except Exception:
-            # If anything fails, wait and try again
-            time.sleep(poll_s)
+        have_lock = False
+        my_epoch: int | None = None
 
+        try:
+            while not self._stop.is_set():
+                if not have_lock:
+                    got = conn.execute(
+                        "SELECT pg_try_advisory_lock(%s);", (self._lock_key,)
+                    ).fetchone()[0]
 
-def read_role(db_url: str, node_id: str) -> RoleState:
-    """
-    Read current role info from dspu_meta.
-    Standby nodes use this for /role responses and for NOT_LEADER errors.
-    """
-    ensure_schema_with_retry(db_url)
+                    if got:
+                        # became leader — increment epoch and record leader_id
+                        with conn.transaction():
+                            row = conn.execute(
+                                "SELECT v FROM dspu_meta WHERE k='leader_epoch';"
+                            ).fetchone()
+                            new_epoch = (int(row[0]) if row else 0) + 1
+                            conn.execute(
+                                "INSERT INTO dspu_meta (k,v) VALUES ('leader_epoch',%s) "
+                                "ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v;",
+                                (str(new_epoch),),
+                            )
+                            conn.execute(
+                                "INSERT INTO dspu_meta (k,v) VALUES ('leader_id',%s) "
+                                "ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v;",
+                                (self._node_id,),
+                            )
+                        my_epoch = new_epoch
+                        have_lock = True
+                        self._set_state(role="LEADER", leader_epoch=my_epoch, leader_id=self._node_id)
+                    else:
+                        # standby — read current epoch/leader best-effort
+                        try:
+                            row = conn.execute(
+                                "SELECT v FROM dspu_meta WHERE k='leader_epoch';"
+                            ).fetchone()
+                            epoch = int(row[0]) if row else 0
+                            lid = conn.execute(
+                                "SELECT v FROM dspu_meta WHERE k='leader_id';"
+                            ).fetchone()
+                            leader_id = lid[0] if lid else None
+                        except Exception:
+                            epoch = 0
+                            leader_id = None
+                        self._set_state(role="STANDBY", leader_epoch=epoch, leader_id=leader_id)
+                else:
+                    self._set_state(role="LEADER", leader_epoch=my_epoch, leader_id=self._node_id)
 
-    leader_id = "unknown"
-    leader_epoch = 0
+                time.sleep(self._poll_s)
 
-    try:
-        with psycopg.connect(db_url) as conn:
-            r1 = conn.execute("SELECT v FROM dspu_meta WHERE k='leader_id';").fetchone()
-            if r1:
-                leader_id = r1[0]
-            r2 = conn.execute("SELECT v FROM dspu_meta WHERE k='leader_epoch';").fetchone()
-            if r2:
-                leader_epoch = int(r2[0])
-    except Exception:
-        # best-effort; leave defaults
-        pass
+        finally:
+            if have_lock:
+                try:
+                    conn.execute("SELECT pg_advisory_unlock(%s);", (self._lock_key,))
+                except Exception:
+                    pass
+            try:
+                conn.close()
+            except Exception:
+                pass
 
-    # Role is computed by "am I the leader_id?"
-    role = "LEADER" if leader_id == node_id else "STANDBY"
-    return RoleState(role=role, node_id=node_id, leader_id=leader_id, leader_epoch=leader_epoch)
+    def _set_state(self, *, role: str, leader_epoch: int | None, leader_id: str | None) -> None:
+        with self._state_lock:
+            self._state = LeaderState(
+                node_id=self._node_id,
+                role=role,
+                leader_epoch=leader_epoch,
+                leader_id=leader_id,
+            )
