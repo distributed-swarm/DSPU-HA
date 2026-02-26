@@ -47,7 +47,13 @@ def _shutdown():
 
 @app.get("/healthz")
 def healthz():
-    return {"ok": True}
+    s = state()
+    return {
+        "ok": True,
+        "role": s.role,
+        "leader_epoch": s.leader_epoch,
+        "leader_id": s.leader_id,
+    }
 
 @app.get("/role")
 def role():
