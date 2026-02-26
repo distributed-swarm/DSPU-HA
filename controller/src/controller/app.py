@@ -21,8 +21,17 @@ def not_leader_payload() -> dict:
     }
 
 def ensure_leader_or_409() -> JSONResponse | None:
-    if state().role != "LEADER":
-        return JSONResponse(status_code=409, content=not_leader_payload())
+    s = state()
+    if s.role != "LEADER":
+        # Always include fencing info so clients can react correctly.
+        return JSONResponse(
+            status_code=409,
+            content=not_leader_payload(),
+            headers={
+                "x-dspu-leader-epoch": str(s.leader_epoch),
+                "x-dspu-leader-id": s.leader_id,
+            },
+        )
     return None
 
 app = FastAPI(title="DSPU Controller (v0)")
