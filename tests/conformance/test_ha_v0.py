@@ -6,6 +6,22 @@ import time
 import httpx
 
 
+def dump_proc(p: subprocess.Popen, label: str) -> None:
+    """
+    Best-effort dump of a controller subprocess output to make CI failures obvious.
+    """
+    try:
+        rc = p.poll()
+        print(f"\n--- {label} (pid={p.pid}) returncode={rc} ---")
+        if p.stdout:
+            out = p.stdout.read()
+            if out:
+                print(out)
+        print(f"--- end {label} ---\n")
+    except Exception as e:
+        print(f"\n--- {label} dump failed: {e!r} ---\n")
+
+
 def wait_http(url: str, timeout_s: float = 10.0) -> None:
     deadline = time.time() + timeout_s
     last = None
@@ -28,6 +44,9 @@ def start_controller(node_id: str, port: int, db_url: str) -> subprocess.Popen:
     e["DATABASE_URL"] = db_url
     # faster polling for tests
     e["LEADER_POLL_S"] = "0.2"
+    # allow schema init retry on CI
+    e.setdefault("PG_SCHEMA_RETRY_S", "15")
+    e.setdefault("PG_SCHEMA_RETRY_INTERVAL_S", "0.5")
 
     return subprocess.Popen(
         [sys.executable, "-m", "controller"],
@@ -54,8 +73,14 @@ def test_single_leader_and_not_leader_guard():
     try:
         a = "http://127.0.0.1:18080"
         b = "http://127.0.0.1:18081"
-        wait_http(f"{a}/healthz")
-        wait_http(f"{b}/healthz")
+
+        try:
+            wait_http(f"{a}/healthz")
+            wait_http(f"{b}/healthz")
+        except Exception:
+            dump_proc(p1, "controller-a")
+            dump_proc(p2, "controller-b")
+            raise
 
         # Wait until one becomes leader
         deadline = time.time() + 10
@@ -107,6 +132,10 @@ def test_single_leader_and_not_leader_guard():
         assert "node_id" in body
 
     finally:
+        # Always dump logs so failures are obvious in CI
+        dump_proc(p1, "controller-a")
+        dump_proc(p2, "controller-b")
+
         for p in (p1, p2):
             p.terminate()
         for p in (p1, p2):
