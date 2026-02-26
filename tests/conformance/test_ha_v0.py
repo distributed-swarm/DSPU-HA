@@ -87,15 +87,24 @@ def test_single_leader_and_not_leader_guard():
         assert leader_role["leader_epoch"] >= 1
 
         # Mutating endpoint works on leader (204)
-        rL = httpx.post(f"{leader_base}/v1/leases", json={"agent": "a", "capabilities": ["echo"]}, timeout=2.0)
+        rL = httpx.post(
+            f"{leader_base}/v1/leases",
+            json={"agent": "a", "capabilities": ["echo"]},
+            timeout=2.0,
+        )
         assert rL.status_code == 204
 
         # Mutating endpoint rejected on standby (409 NOT_LEADER)
-        rS = httpx.post(f"{standby_base}/v1/leases", json={"agent": "a", "capabilities": ["echo"]}, timeout=2.0)
+        rS = httpx.post(
+            f"{standby_base}/v1/leases",
+            json={"agent": "a", "capabilities": ["echo"]},
+            timeout=2.0,
+        )
         assert rS.status_code == 409
         body = rS.json()
         assert body["error"] == "NOT_LEADER"
         assert body["role"] == "STANDBY"
+        assert "node_id" in body
 
     finally:
         for p in (p1, p2):
