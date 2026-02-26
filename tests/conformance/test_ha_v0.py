@@ -4,7 +4,6 @@ import sys
 import time
 
 import httpx
-import pytest
 
 
 def wait_http(url: str, timeout_s: float = 10.0) -> None:
@@ -22,12 +21,14 @@ def wait_http(url: str, timeout_s: float = 10.0) -> None:
     raise RuntimeError(f"Service not ready at {url}: {last}")
 
 
-def start_controller(env: dict, port: int) -> subprocess.Popen:
+def start_controller(node_id: str, port: int, db_url: str) -> subprocess.Popen:
     e = os.environ.copy()
-    e.update(env)
     e["PORT"] = str(port)
+    e["NODE_ID"] = node_id
+    e["DATABASE_URL"] = db_url
+    # faster polling for tests
+    e["LEADER_POLL_S"] = "0.2"
 
-    # Run controller module from the controller package directory
     return subprocess.Popen(
         [sys.executable, "-m", "controller"],
         cwd="controller",
@@ -38,48 +39,69 @@ def start_controller(env: dict, port: int) -> subprocess.Popen:
     )
 
 
-@pytest.mark.parametrize(
-    "role, expected_status, expected_error",
-    [
-        ("STANDBY", 409, "NOT_LEADER"),
-        ("LEADER", 204, None),
-    ],
-)
-def test_mutating_endpoint_guard(role, expected_status, expected_error):
-    port = 18080 if role == "STANDBY" else 18081
-    base = f"http://127.0.0.1:{port}"
+def get_role(base: str) -> dict:
+    r = httpx.get(f"{base}/role", timeout=2.0)
+    r.raise_for_status()
+    return r.json()
 
-    p = start_controller(
-        env={
-            "ROLE": role,
-            "NODE_ID": f"node-{role.lower()}",
-            "LEADER_EPOCH": "1",
-            "LEADER_ID": "node-leader",
-            "LEADER_URL": "http://127.0.0.1:18081",
-        },
-        port=port,
-    )
+
+def test_single_leader_and_not_leader_guard():
+    db_url = os.environ["DATABASE_URL"]
+
+    p1 = start_controller("node-a", 18080, db_url)
+    p2 = start_controller("node-b", 18081, db_url)
 
     try:
-        wait_http(f"{base}/healthz")
+        a = "http://127.0.0.1:18080"
+        b = "http://127.0.0.1:18081"
+        wait_http(f"{a}/healthz")
+        wait_http(f"{b}/healthz")
 
-        r_role = httpx.get(f"{base}/role")
-        assert r_role.status_code == 200
-        j = r_role.json()
-        assert j["role"] == role
-        assert j["node_id"].startswith("node-")
+        # Wait until one becomes leader
+        deadline = time.time() + 10
+        leader = None
+        standby = None
+        last = None
 
-        r = httpx.post(f"{base}/v1/leases", json={"agent": "a", "capabilities": ["echo"]})
-        assert r.status_code == expected_status
+        while time.time() < deadline:
+            ra = get_role(a)
+            rb = get_role(b)
+            last = (ra, rb)
 
-        if expected_error:
-            body = r.json()
-            assert body["error"] == expected_error
-            assert body["role"] == role
-            assert "node_id" in body
+            roles = {ra["role"], rb["role"]}
+            if roles == {"LEADER", "STANDBY"}:
+                if ra["role"] == "LEADER":
+                    leader, standby = (a, ra), (b, rb)
+                else:
+                    leader, standby = (b, rb), (a, ra)
+                break
+
+            time.sleep(0.2)
+
+        assert leader is not None, f"never converged to one leader: {last}"
+
+        leader_base, leader_role = leader
+        standby_base, standby_role = standby
+
+        assert isinstance(leader_role["leader_epoch"], int)
+        assert leader_role["leader_epoch"] >= 1
+
+        # Mutating endpoint works on leader (204)
+        rL = httpx.post(f"{leader_base}/v1/leases", json={"agent": "a", "capabilities": ["echo"]}, timeout=2.0)
+        assert rL.status_code == 204
+
+        # Mutating endpoint rejected on standby (409 NOT_LEADER)
+        rS = httpx.post(f"{standby_base}/v1/leases", json={"agent": "a", "capabilities": ["echo"]}, timeout=2.0)
+        assert rS.status_code == 409
+        body = rS.json()
+        assert body["error"] == "NOT_LEADER"
+        assert body["role"] == "STANDBY"
+
     finally:
-        p.terminate()
-        try:
-            p.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            p.kill()
+        for p in (p1, p2):
+            p.terminate()
+        for p in (p1, p2):
+            try:
+                p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                p.kill()
